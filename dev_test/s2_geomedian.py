@@ -20,8 +20,9 @@ from skimage.morphology import binary_dilation, disk
 def run_tile(x, y, time, output_filename, cloud_labels=[3,8,9,10], cloud_buffer=0, bad_labels=[0,1],
              crs="EPSG:6933", output_crs="EPSG:6933", resolution=(-20,20),
              dask_chunks = {'time': -1, 'x':2000, 'y': 2000},
+             cloud_cover = [0, 100],
              bands=['blue','green','red','red_edge_1','red_edge_2','red_edge_3','nir_1', 'nir_2','swir_1','swir_2'], 
-             redo = False):
+             redo = False, **kwargs):
     
     outputdir = os.path.dirname(output_filename)
     if not os.path.exists(outputdir): os.mkdir(outputdir)
@@ -37,7 +38,8 @@ def run_tile(x, y, time, output_filename, cloud_labels=[3,8,9,10], cloud_buffer=
                    resolution=resolution, 
                    group_by="solar_day",
                    dask_chunks=dask_chunks,
-                   x = x, y = y, time = time)
+                   x = x, y = y, time = time,
+                   **kwargs)
 
     if not bands[0] in data:
         print("No data found")
@@ -62,6 +64,8 @@ def run_tile(x, y, time, output_filename, cloud_labels=[3,8,9,10], cloud_buffer=
    
     if dask_chunks: ref= ref.compute()
     ref.attrs['crs'] = geometry.CRS(output_crs).wkt
+    ref.attrs['nobs'] = len(data.time)
+    ref.attrs['cloud_cover'] = f'{cloud_cover[0]}-{cloud_cover[1]}'
     #with ProgressBar(dt=10):
     ref.to_netcdf(output_filename)
     return ref
