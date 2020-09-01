@@ -39,6 +39,7 @@ def run_tile(x, y, time, output_filename, cloud_labels=[3,8,9,10], cloud_buffer=
                    group_by="solar_day",
                    dask_chunks=dask_chunks,
                    x = x, y = y, time = time,
+                   cloud_cover=cloud_cover,
                    **kwargs)
 
     if not bands[0] in data:
