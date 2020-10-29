@@ -28,8 +28,9 @@ Functions included:
     first
     last
     nearest
+    load_from_cog
 
-Last modified: March 2020
+Last modified: Oct 2020
 
 '''
 
@@ -54,6 +55,10 @@ from random import randint
 import numexpr as ne
 import dask
 import dask.array as da
+
+from datacube.utils.geometry import GeoBox, box, CRS
+import rioxarray
+from odc.algo import xr_reproject
 
 
 def _dc_query_only(**kw):
@@ -877,3 +882,56 @@ def nearest(array: xr.DataArray, dim: str, target, index_name: str = None) -> xr
                                              da_after[index_name])
     return nearest_array
 
+
+def load_from_cog(url, name=None, resampling = 'nearest', chunks = dict(x=10_000, y=10_000), **kwargs):
+    """
+    Load raster data from Cloud Optimized Geotiff stored in public AWS S3 bucket.
+    
+    Last modified: Oct 2020
+    
+    Parameters
+    ----------
+    url: str
+        URL of the cog file
+
+    name: str
+        name of the variable. If not supplied, cog filename will be used.
+        
+    resampling: str
+        resampling method to be used in xr_reproject().
+    
+    chunks: dict
+        chunk size used for lazy load of the raster
+    
+    **kwargs: a set of keyword arguments to define output geometry.
+        One of below is required:
+        `geobox`, a datacube.utils.geometry._base.GeoBox object;
+        `x`, `y`, `resolution` and `output_crs` and an optional `crs` for input `x` and `y`.
+    
+    Returns
+    -------
+    a xarray.DataArray contains the reprojected raster
+    
+    """  
+    output_grid = kwargs.get('geobox')
+    if output_grid is None:
+        try:
+            x = kwargs['x']
+            y = kwargs['y']
+            resolution = kwargs['resolution']
+            output_crs = kwargs['output_crs']
+            input_crs = kwargs.get('crs', 'EPSG:4326')
+        except KeyError:
+            print("x, y, resolution and output_crs are required if geobox is not supplied.")
+            return
+        # define output geometry
+        gbox = box(x[0], y[0], x[1], y[1], crs = input_crs)
+        # define output bounding box
+        output_gbox = gbox.to_crs(crs=CRS(output_crs))
+        # define output grid
+        output_grid = GeoBox.from_geopolygon(output_gbox, resolution = resolution)
+
+    img_all = rioxarray.open_rasterio(url, chunks=chunks).squeeze('band')
+    if name is None: name = url.split('/')[-1].split('.')[0]
+    img_all.name = name 
+    return xr_reproject(img_all, output_grid, resampling=resampling).compute()
