@@ -96,18 +96,19 @@ def get_geo_coordinates(parsed, res, nrows=None, ncols=None, row_step=None, col_
     else:
         return {'x': ulx+np.arange(ncols)*np.sign(xdim)*col_step, 'y': uly+np.arange(nrows)*np.sign(ydim)*row_step}
 
-def fill_nan(row):
+def fill_nan(row, method='nearest'):
     # extraplate a partial row
     valid = ~np.isnan(row)
     if valid.all(): return row
+    if valid.sum()<2: return row
     output_x = np.arange(len(row))
     input_x = output_x[valid]
-    f = interpolate.interp1d(input_x, row[valid], fill_value='extrapolate')
+    f = interpolate.interp1d(input_x, row[valid], kind=method, fill_value='extrapolate')
     return f(output_x)
 
 
 def fill_nan_2d(table_raw):
-    # extrapolate (nearest neighbor) a partial image
+    # extrapolate (spline) a partial image
     valid = ~np.isnan(table_raw)
     output_y = np.arange(table_raw.shape[0])
     output_x = np.arange(table_raw.shape[1])
