@@ -25,25 +25,31 @@ Functions included:
     contours_to_array
     largest_region
     transform_geojson_wgs_to_epsg
+    zonal_stats_parallel
 
 Last modified: February 2020
 
 '''
 
 # Import required packages
-import osr
-import ogr
+from osgeo import osr
+from osgeo import ogr
+import fiona
 import collections
 import numpy as np
 import xarray as xr
 import geopandas as gpd
 import rasterio.features
 import scipy.interpolate
+import multiprocessing as mp
 from scipy import ndimage as nd
 from skimage.measure import label
+from rasterstats import zonal_stats
 from skimage.measure import find_contours
-from shapely.geometry import LineString, MultiLineString, shape
+from shapely.geometry import mapping, shape
 from datacube.helpers import write_geotiff
+from datacube.utils.geometry import assign_crs
+from shapely.geometry import LineString, MultiLineString, shape
 
 def xr_vectorize(da, 
                  attribute_col='attribute', 
@@ -91,16 +97,16 @@ def xr_vectorize(da,
     gdf : Geopandas GeoDataFrame
     
     """
-
-    
-    # Check for a crs object
     try:
-        crs = da.crs
+        crs = da.geobox.crs
     except:
-        if crs is None:
-            raise Exception("Please add a `crs` attribute to the "
+        try:
+            crs = da.crs
+        except:
+            if crs is None:
+                raise Exception("Please add a `crs` attribute to the "
                             "xarray.DataArray, or provide a CRS using the "
-                            "function's `crs` parameter (e.g. 'EPSG:102022')")
+                            "function's `crs` parameter (e.g. 'EPSG:6933')")
             
     # Check if transform is provided as a xarray.DataArray method.
     # If not, require supplied Affine
@@ -146,7 +152,7 @@ def xr_vectorize(da,
     # Create a geopandas dataframe populated with the polygon shapes
     gdf = gpd.GeoDataFrame(data={attribute_col: values},
                            geometry=polygons,
-                           crs={'init': str(crs)})
+                           crs=crs)
     
     # If a file path is supplied, export a shapefile
     if export_shp:
@@ -263,8 +269,7 @@ def xr_rasterize(gdf,
         y, x = len(xy_coords[0]), len(xy_coords[1])
     
     # Reproject shapefile to match CRS of raster
-    print(f'Rasterizing to match xarray.DataArray dimensions ({y}, {x}) '
-          f'and projection system/CRS (e.g. {crs})')
+    print(f'Rasterizing to match xarray.DataArray dimensions ({y}, {x})')
     
     try:
         gdf_reproj = gdf.to_crs(crs=crs)
@@ -296,14 +301,14 @@ def xr_rasterize(gdf,
                         name=name if name else None)
     
     # Add back crs if xarr.attrs doesn't have it
-    if 'crs' not in xarr.attrs:
-        xarr.attrs['crs'] = str(crs)
+    if xarr.geobox is None:
+        xarr = assign_crs(xarr, str(crs))
     
     if export_tiff:        
         print(f"Exporting GeoTIFF to {export_tiff}")
-        ds = xarr.to_dataset(name=name if name else 'data')      
-        ds.attrs = xarr.attrs  # xarray bug removes metadata, add it back
-        write_geotiff(export_tiff, ds) 
+        write_cog(xarr,
+                  export_tiff,
+                  overwrite=True)
                 
     return xarr
 
@@ -419,7 +424,7 @@ def subpixel_contours(da,
         # Extracts contours from array, and converts each discrete
         # contour into a Shapely LineString feature
         line_features = [LineString(i[:,[1, 0]]) 
-                         for i in find_contours(da_i, z_value) 
+                         for i in find_contours(da_i.data, z_value) 
                          if i.shape[0] > min_vertices]
 
         # Output resulting lines into a single combined MultiLineString
@@ -760,3 +765,88 @@ def transform_geojson_wgs_to_epsg(geojson, EPSG):
     transformed_geojson = eval(polygon.ExportToJson())
 
     return transformed_geojson
+
+
+def zonal_stats_parallel(shp,
+                         raster,
+                         statistics,
+                         out_shp,
+                         ncpus,
+                         **kwargs):
+
+    """
+    Summarizing raster datasets based on vector geometries in parallel.
+    Each cpu recieves an equal chunk of the dataset. 
+    Utilizes the perrygeo/rasterstats package.
+    
+    Parameters
+    ----------
+    shp : str
+        Path to shapefile that contains polygons over
+        which zonal statistics are calculated
+    raster: str
+        Path to the raster from which the statistics are calculated.
+        This can be a virtual raster (.vrt).
+    statistics: list
+        list of statistics to calculate. e.g.
+            ['min', 'max', 'median', 'majority', 'sum']
+    out_shp: str
+        Path to export shapefile containing zonal statistics.
+    ncpus: int
+        number of cores to parallelize the operations over. 
+    kwargs: 
+        Any other keyword arguments to rasterstats.zonal_stats()
+        See https://github.com/perrygeo/python-rasterstats for
+        all options
+            
+    Returns
+    -------
+    Exports a shapefile to disk containing the zonal statistics requested
+    
+    """
+    
+    #yields n sized chunks from list l (used for splitting task to multiple processes)
+    def chunks(l, n):
+        for i in range(0, len(l), n):
+            yield l[i:i + n]
+
+    #calculates zonal stats and adds results to a dictionary
+    def worker(z,raster,d):	
+        z_stats = zonal_stats(z,raster,stats=statistics,**kwargs)	
+        for i in range(0,len(z_stats)):
+            d[z[i]['id']]=z_stats[i]
+
+    #write output polygon
+    def write_output(zones, out_shp,d):
+        #copy schema and crs from input and add new fields for each statistic			
+        schema = zones.schema.copy()
+        crs = zones.crs
+        for stat in statistics:			
+            schema['properties'][stat] = 'float'
+
+        with fiona.open(out_shp, 'w', 'ESRI Shapefile', schema, crs) as output:
+            for elem in zones:
+                for stat in statistics:			
+                    elem['properties'][stat]=d[elem['id']][stat]
+                output.write({'properties':elem['properties'],'geometry': mapping(shape(elem['geometry']))})
+    
+    with fiona.open(shp) as zones:
+        jobs = []
+
+        # create manager dictionary (polygon ids=keys, stats=entries)
+        # where multiple processes can write without conflicts
+        man = mp.Manager()	
+        d = man.dict()	
+
+        #split zone polygons into 'ncpus' chunks for parallel processing 
+        # and call worker() for each
+        split = chunks(zones, len(zones)//ncpus)
+        for z in split:
+            p = mp.Process(target=worker,args=(z, raster,d))
+            p.start()
+            jobs.append(p)
+
+        #wait that all chunks are finished
+        [j.join() for j in jobs]
+
+        write_output(zones,out_shp,d)		
