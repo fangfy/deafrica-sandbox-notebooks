@@ -35,7 +35,7 @@ Last modified: March 2020
 
 # Import required packages
 import os
-import gdal
+from osgeo import gdal
 import requests
 import zipfile
 import warnings
@@ -114,6 +114,7 @@ def load_ard(dc,
              ls7_slc_off=True,
              predicate=None,
              dtype='auto',
+             scaling='raw',
              **kwargs):
 
     '''
@@ -198,6 +199,12 @@ def load_ard(dc,
         if data is loaded in its native dtype, nodata and masked 
         pixels will be returned with the data's native nodata value 
         (typically -999), not NaN. 
+    scaling : str, optional
+        If 'normalised', then surface reflectance values are scaled from
+        their original values to 0-1.  If 'raw' then dataset is returned
+        in its native scaling. WARNING: USGS Landsat Collection 2
+        surface reflectance values have an offset so normliaed band indices 
+        will return non-sensical results if setting scaling='raw'. 
     **kwargs :
         A set of keyword arguments to `dc.load` that define the
         spatiotemporal query used to extract data. This typically
@@ -418,7 +425,7 @@ def load_ard(dc,
         data_perc = (pq_mask.sum(axis=[1, 2], dtype='int32') /
                      (pq_mask.shape[1] * pq_mask.shape[2]))
         
-        keep = data_perc >= min_gooddata
+        keep = (data_perc >= min_gooddata).persist()
         
         # Filter by `min_gooddata` to drop low quality observations
         total_obs = len(ds.time)
@@ -478,6 +485,42 @@ def load_ard(dc,
     if requested_measurements:
         ds = ds[requested_measurements]
     
+    # Scale data 0-1 if requested
+    if scaling=='normalised':
+        
+        if product_type == 'c1':
+            print("Re-scaling Landsat C1 data")
+            not_sr_bands = ['pixel_qa','sr_aerosol','radsat_qa']
+        
+            for band in ds.data_vars:
+                if band not in not_sr_bands:
+                    ds[band]=ds[band]/10000
+
+        if product_type == 's2':
+            print("Re-scaling Sentinel-2 data")
+            not_sr_bands = ['scl','qa','mask','water_vapour','aerosol_optical_thickness']
+        
+            for band in ds.data_vars:
+                if band not in not_sr_bands:
+                    ds[band]=ds[band]/10000   
+    
+    # Collection 2 Landsat raw values aren't useful so rescale,
+    # need different factors for surface-temp and SR
+    if product_type == 'c2':
+        print("Re-scaling Landsat C2 data")
+        not_sr_bands = ['thermal_radiance','upwell_radiance','upwell_radiance',
+                        'atmospheric_transmittance','emissivity','emissivity_stdev',
+                        'cloud_distance', 'quality_l2_aerosol','quality_l2_surface_temperature',
+                        'quality_l1_pixel','quality_l1_radiometric_saturation','surface_temperature']
+        
+        for band in ds.data_vars:
+        
+            if band == 'surface_temperature':
+                ds[band]=ds[band]*0.00341802 + 149.0 - 273.15
+        
+            if band not in not_sr_bands:
+                ds[band]=ds[band]* 2.75e-5 - 0.2
+            
     # If user supplied dask_chunks, return data as a dask array without
     # actually loading it in
     if dask_chunks is not None:
@@ -572,12 +615,14 @@ def mostcommon_crs(dc, product, query):
     
     """
     
-    # remove dask_chunks & align to prevent func failing
-    #prevent function altering dictionary kwargs
+    
+    # prevent function altering dictionary kwargs
     query = deepcopy(query)
+    
+    # remove dask_chunks & align to prevent func failing
     if 'dask_chunks' in query:
         query.pop('dask_chunks', None)
-    
+ 
     if 'align' in query:
         query.pop('align', None)
     
@@ -587,19 +632,32 @@ def mostcommon_crs(dc, product, query):
     # Extract all CRSs
     crs_list = [str(i.crs) for i in matching_datasets]    
    
-    # Identify most common CRS
-    crs_counts = Counter(crs_list)
-    crs_mostcommon = crs_counts.most_common(1)[0][0]
+    # If CRSs are returned
+    if len(crs_list) > 0:
 
-    # Warn user if multiple CRSs are encountered
-    if len(crs_counts.keys()) > 1:
+        # Identify most common CRS
+        crs_counts = Counter(crs_list)
+        crs_mostcommon = crs_counts.most_common(1)[0][0]
 
-        warnings.warn(f'Multiple UTM zones {list(crs_counts.keys())} '
-                      f'were returned for this query. Defaulting to '
-                      f'the most common zone: {crs_mostcommon}', 
-                      UserWarning)
+        # Warn user if multiple CRSs are encountered
+        if len(crs_counts.keys()) > 1:
+
+            warnings.warn(f'Multiple UTM zones {list(crs_counts.keys())} '
+                          f'were returned for this query. Defaulting to '
+                          f'the most common zone: {crs_mostcommon}',
+                          UserWarning)
+
+        return crs_mostcommon
     
-    return crs_mostcommon
+    else:
+        
+        raise ValueError(f'No CRS was returned as no data was found for '
+                         f'the supplied product ({product}) and query. '
+                         f'Please ensure that data is available for '
+                         f'{product} for the spatial extents and time '
+                         f'period specified in the query (e.g. by using '
+                         f'the Data Cube Explorer for this datacube '
+                         f'instance).')
 
 
 def download_unzip(url,
