@@ -25,6 +25,9 @@ Functions included:
     download_unzip
     wofs_fuser
     dilate
+    first
+    last
+    nearest
 
 Last modified: March 2020
 
@@ -32,17 +35,18 @@ Last modified: March 2020
 
 # Import required packages
 import os
-import gdal
+from osgeo import gdal
 import requests
 import zipfile
 import warnings
 import numpy as np
 import xarray as xr
+import pandas as pd
 import datetime
 import pytz
 
 from collections import Counter
-from datacube.storage import masking
+from datacube.utils import masking
 from scipy.ndimage import binary_dilation
 from copy import deepcopy
 import odc.algo
@@ -110,6 +114,7 @@ def load_ard(dc,
              ls7_slc_off=True,
              predicate=None,
              dtype='auto',
+             scaling='raw',
              **kwargs):
 
     '''
@@ -118,15 +123,14 @@ def load_ard(dc,
     optionally applies pixel quality masks, and drops time steps that 
     contain greater than a minimum proportion of good quality (e.g. non-
     cloudy or shadowed) pixels. 
-    The function supports loading the following DEA frica products:
+    The function supports loading the following DE Africa products:
     
         ls5_usgs_sr_scene
         ls7_usgs_sr_scene
         ls8_usgs_sr_scene
         usgs_ls8c_level2_2
         ga_ls8c_fractional_cover_2
-        s2a_msil2a
-        s2b_msil2a
+        s2_l2a
 
     Last modified: March 2020
     
@@ -139,7 +143,7 @@ def load_ard(dc,
         A list of product names to load data from. Valid options are
         Landsat C1: ['ls5_usgs_sr_scene', 'ls7_usgs_sr_scene', 'ls8_usgs_sr_scene'],
         Landsat C2: ['usgs_ls8c_level2_2']
-        Sentinel-2: ['s2a_msil2a', 's2b_msil2a']
+        Sentinel-2: ['s2_l2a']
     min_gooddata : float, optional
         An optional float giving the minimum percentage of good quality
         pixels required for a satellite observation to be loaded.
@@ -195,6 +199,12 @@ def load_ard(dc,
         if data is loaded in its native dtype, nodata and masked 
         pixels will be returned with the data's native nodata value 
         (typically -999), not NaN. 
+    scaling : str, optional
+        If 'normalised', then surface reflectance values are scaled from
+        their original values to 0-1.  If 'raw' then dataset is returned
+        in its native scaling. WARNING: USGS Landsat Collection 2
+        surface reflectance values have an offset so normliaed band indices 
+        will return non-sensical results if setting scaling='raw'. 
     **kwargs :
         A set of keyword arguments to `dc.load` that define the
         spatiotemporal query used to extract data. This typically
@@ -260,7 +270,7 @@ def load_ard(dc,
     
     elif product_type == 's2':
         print('Using pixel quality parameters for Sentinel 2')
-        fmask_band = 'scl'
+        fmask_band = 'SCL'
     
     measurements = requested_measurements.copy() if requested_measurements else None
     
@@ -280,7 +290,7 @@ def load_ard(dc,
         else:
             if fmask_band not in measurements:
                 measurements.append(fmask_band)
-    
+   
     # Get list of data and mask bands so that we can later exclude
     # mask bands from being masked themselves
     if product_type == 'fc':
@@ -398,9 +408,12 @@ def load_ard(dc,
                                     **quality_flags_prod)
     # sentinel 2                     
     if product_type == 's2':
-        pq_mask = odc.algo.fmask_to_bool(ds[fmask_band],
-                                     categories=pq_categories_s2)
-
+        #currently broken for mask band values >=8
+        #pq_mask = odc.algo.fmask_to_bool(ds[fmask_band],
+        #                             categories=pq_categories_s2)
+        flags_s2 = dc.list_measurements().loc[products[0]].loc[fmask_band]['flags_definition']['qa']['values']
+        pq_mask = ds[fmask_band].isin([int(k) for k,v in flags_s2.items() if v in pq_categories_s2])
+    
     # The good data percentage calculation has to load in all `fmask`
     # data, which can be slow. If the user has chosen no filtering
     # by using the default `min_gooddata = 0`, we can skip this step
@@ -412,7 +425,7 @@ def load_ard(dc,
         data_perc = (pq_mask.sum(axis=[1, 2], dtype='int32') /
                      (pq_mask.shape[1] * pq_mask.shape[2]))
         
-        keep = data_perc >= min_gooddata
+        keep = (data_perc >= min_gooddata).persist()
         
         # Filter by `min_gooddata` to drop low quality observations
         total_obs = len(ds.time)
@@ -443,7 +456,7 @@ def load_ard(dc,
     # Mask data if either of the above masks were generated
     if mask is not None:  
             ds_data = odc.algo.keep_good_only(ds_data, where=mask)
-
+    
     # Automatically set dtype to either native or float32 depending
     # on whether masking was requested
     if dtype == 'auto':
@@ -462,7 +475,6 @@ def load_ard(dc,
     else:
         attrs = ds.attrs
         ds = xr.merge([ds_data, ds_masks])
-        ds = ds_data
         ds.attrs.update(attrs)
 
     ###############
@@ -473,6 +485,42 @@ def load_ard(dc,
     if requested_measurements:
         ds = ds[requested_measurements]
     
+    # Scale data 0-1 if requested
+    if scaling=='normalised':
+        
+        if product_type == 'c1':
+            print("Re-scaling Landsat C1 data")
+            not_sr_bands = ['pixel_qa','sr_aerosol','radsat_qa']
+        
+            for band in ds.data_vars:
+                if band not in not_sr_bands:
+                    ds[band]=ds[band]/10000
+
+        if product_type == 's2':
+            print("Re-scaling Sentinel-2 data")
+            not_sr_bands = ['scl','qa','mask','water_vapour','aerosol_optical_thickness']
+        
+            for band in ds.data_vars:
+                if band not in not_sr_bands:
+                    ds[band]=ds[band]/10000   
+    
+    # Collection 2 Landsat raw values aren't useful so rescale,
+    # need different factors for surface-temp and SR
+    if product_type == 'c2':
+        print("Re-scaling Landsat C2 data")
+        not_sr_bands = ['thermal_radiance','upwell_radiance','upwell_radiance',
+                        'atmospheric_transmittance','emissivity','emissivity_stdev',
+                        'cloud_distance', 'quality_l2_aerosol','quality_l2_surface_temperature',
+                        'quality_l1_pixel','quality_l1_radiometric_saturation','surface_temperature']
+        
+        for band in ds.data_vars:
+        
+            if band == 'surface_temperature':
+                ds[band]=ds[band]*0.00341802 + 149.0 - 273.15
+        
+            if band not in not_sr_bands:
+                ds[band]=ds[band]* 2.75e-5 - 0.2
+            
     # If user supplied dask_chunks, return data as a dask array without
     # actually loading it in
     if dask_chunks is not None:
@@ -567,12 +615,14 @@ def mostcommon_crs(dc, product, query):
     
     """
     
-    # remove dask_chunks & align to prevent func failing
-    #prevent function altering dictionary kwargs
+    
+    # prevent function altering dictionary kwargs
     query = deepcopy(query)
+    
+    # remove dask_chunks & align to prevent func failing
     if 'dask_chunks' in query:
         query.pop('dask_chunks', None)
-    
+ 
     if 'align' in query:
         query.pop('align', None)
     
@@ -582,19 +632,32 @@ def mostcommon_crs(dc, product, query):
     # Extract all CRSs
     crs_list = [str(i.crs) for i in matching_datasets]    
    
-    # Identify most common CRS
-    crs_counts = Counter(crs_list)
-    crs_mostcommon = crs_counts.most_common(1)[0][0]
+    # If CRSs are returned
+    if len(crs_list) > 0:
 
-    # Warn user if multiple CRSs are encountered
-    if len(crs_counts.keys()) > 1:
+        # Identify most common CRS
+        crs_counts = Counter(crs_list)
+        crs_mostcommon = crs_counts.most_common(1)[0][0]
 
-        warnings.warn(f'Multiple UTM zones {list(crs_counts.keys())} '
-                      f'were returned for this query. Defaulting to '
-                      f'the most common zone: {crs_mostcommon}', 
-                      UserWarning)
+        # Warn user if multiple CRSs are encountered
+        if len(crs_counts.keys()) > 1:
+
+            warnings.warn(f'Multiple UTM zones {list(crs_counts.keys())} '
+                          f'were returned for this query. Defaulting to '
+                          f'the most common zone: {crs_mostcommon}',
+                          UserWarning)
+
+        return crs_mostcommon
     
-    return crs_mostcommon
+    else:
+        
+        raise ValueError(f'No CRS was returned as no data was found for '
+                         f'the supplied product ({product}) and query. '
+                         f'Please ensure that data is available for '
+                         f'{product} for the spatial extents and time '
+                         f'period specified in the query (e.g. by using '
+                         f'the Data Cube Explorer for this datacube '
+                         f'instance).')
 
 
 def download_unzip(url,
@@ -701,3 +764,131 @@ def dilate(array, dilation=10, invert=True):
     
     return ~binary_dilation(array.astype(np.bool), 
                             structure=kernel.reshape((1,) + kernel.shape))
+
+
+def _select_along_axis(values, idx, axis):
+    other_ind = np.ix_(*[np.arange(s) for s in idx.shape])
+    sl = other_ind[:axis] + (idx,) + other_ind[axis:]
+    return values[sl]
+
+
+def first(array: xr.DataArray, dim: str, index_name: str = None) -> xr.DataArray:
+    """
+    Finds the first occuring non-null value along the given dimension.
+    
+    Parameters
+    ----------
+    array : xr.DataArray
+         The array to search.
+    dim : str
+        The name of the dimension to reduce by finding the first non-null value.
+    
+    Returns
+    -------
+    reduced : xr.DataArray
+        An array of the first non-null values.
+        The `dim` dimension will be removed, and replaced with a coord of the 
+        same name, containing the value of that dimension where the last value 
+        was found.
+    """
+    axis = array.get_axis_num(dim)
+    idx_first = np.argmax(~pd.isnull(array), axis=axis)
+    reduced = array.reduce(_select_along_axis, idx=idx_first, axis=axis)
+    reduced[dim] = array[dim].isel({dim: xr.DataArray(idx_first, dims=reduced.dims)})
+    if index_name is not None:
+        reduced[index_name] = xr.DataArray(idx_first, dims=reduced.dims)
+    return reduced
+
+
+def last(array: xr.DataArray, dim: str, index_name: str = None) -> xr.DataArray:
+    """
+    Finds the last occuring non-null value along the given dimension.
+    
+    Parameters
+    ----------
+    array : xr.DataArray
+         The array to search.
+    dim : str
+        The name of the dimension to reduce by finding the last non-null value.
+    index_name : str, optional
+        If given, the name of a coordinate to be added containing the index
+        of where on the dimension the nearest value was found.
+    
+    Returns
+    -------
+    reduced : xr.DataArray
+        An array of the last non-null values.
+        The `dim` dimension will be removed, and replaced with a coord of the 
+        same name, containing the value of that dimension where the last value 
+        was found.
+    """
+    axis = array.get_axis_num(dim)
+    rev = (slice(None),) * axis + (slice(None, None, -1),)
+    idx_last = -1 - np.argmax(~pd.isnull(array)[rev], axis=axis)
+    reduced = array.reduce(_select_along_axis, idx=idx_last, axis=axis)
+    reduced[dim] = array[dim].isel({dim: xr.DataArray(idx_last, dims=reduced.dims)})
+    if index_name is not None:
+        reduced[index_name] = xr.DataArray(idx_last, dims=reduced.dims)
+    return reduced
+
+
+def nearest(array: xr.DataArray, dim: str, target, index_name: str = None) -> xr.DataArray:
+    """
+    Finds the nearest values to a target label along the given dimension, for
+    all other dimensions.
+    
+    E.g. For a DataArray with dimensions ('time', 'x', 'y')
+    
+        nearest_array = nearest(array, 'time', '2017-03-12')
+        
+    will return an array with the dimensions ('x', 'y'), with non-null values 
+    found closest for each (x, y) pixel to that location along the time 
+    dimension.
+    
+    The returned array will include the 'time' coordinate for each x,y pixel
+    that the nearest value was found.
+    
+    Parameters
+    ----------
+    array : xr.DataArray
+         The array to search.
+    dim : str
+        The name of the dimension to look for the target label.
+    target : same type as array[dim]
+        The value to look up along the given dimension.
+    index_name : str, optional
+        If given, the name of a coordinate to be added containing the index
+        of where on the dimension the nearest value was found.
+    
+    Returns
+    -------
+    nearest_array : xr.DataArray
+        An array of the nearest non-null values to the target label.
+        The `dim` dimension will be removed, and replaced with a coord of the 
+        same name, containing the value of that dimension closest to the
+        given target label.
+    """
+    before_target = slice(None, target)
+    after_target = slice(target, None)
+    
+    da_before = array.sel({dim: before_target})
+    da_after = array.sel({dim: after_target})
+        
+    da_before = last(da_before, dim, index_name) if da_before[dim].shape[0] else None
+    da_after = first(da_after, dim, index_name) if da_after[dim].shape[0] else None
+    
+    if da_before is None and da_after is not None:
+        return da_after
+    if da_after is None and da_before is not None:
+        return da_before
+    
+    target = array[dim].dtype.type(target)
+    is_before_closer = abs(target - da_before[dim]) < abs(target - da_after[dim])
+    nearest_array = xr.where(is_before_closer, da_before, da_after)
+    nearest_array[dim] = xr.where(is_before_closer, da_before[dim], da_after[dim])
+    if index_name is not None:
+        nearest_array[index_name] = xr.where(is_before_closer, 
+                                             da_before[index_name], 
+                                             da_after[index_name])
+    return nearest_array
+
